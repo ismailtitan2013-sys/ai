@@ -43,7 +43,7 @@ self.onmessage = async (event) => {
       });
       let answer = result?.[0]?.generated_text ?? result?.generated_text ?? '';
       if (Array.isArray(answer)) answer = answer.at(-1)?.content || '';
-      answer = String(answer).replace(/<\\|im_end\\|>[\\s\\S]*$/,'').replace(/^\\s*<\\|im_start\\|>assistant\\s*/,'').trim();
+      answer = String(answer).replace(/<\|im_end\|>[\s\S]*$/,'').replace(/^\s*<\|im_start\|>assistant\s*/,'').trim();
       self.postMessage({ type: 'result', id: msg.id, answer });
     } catch (error) {
       self.postMessage({ type: 'error', id: msg.id, error: String(error?.message || error), stage: 'generate' });
