@@ -9,6 +9,7 @@ const SAMPLE_RATE = 16000;
 const MALE_SPEAKER_ID = 1;
 const BLANK_TOKEN = '_';
 const UNKNOWN_TOKEN = '<unk>';
+const NETWORK_IDLE_MS = 45000;
 
 let session = null;
 let vocab = null;
@@ -20,75 +21,106 @@ function progress(stage, percent, message) {
 }
 
 async function fetchJson(url) {
-  const response = await fetch(url, { mode: 'cors', cache: 'force-cache' });
-  if (!response.ok) throw new Error(`Не удалось загрузить словарь голоса (${response.status}).`);
-  return response.json();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), NETWORK_IDLE_MS);
+  try {
+    const response = await fetch(url, { mode: 'cors', cache: 'force-cache', signal: controller.signal });
+    if (!response.ok) throw new Error(`Не удалось загрузить словарь голоса (${response.status}).`);
+    return await response.json();
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error('Сервер не ответил при загрузке словаря голоса за 45 секунд.');
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-async function downloadModelAttempt(attempt) {
-  const response = await fetch(MODEL_URL, { mode: 'cors', cache: 'no-store' });
-  if (!response.ok) throw new Error(`Сервер модели ответил кодом ${response.status}.`);
+async function downloadModelAttempt() {
+  const abort = new AbortController();
+  let idleTimer = null;
+  let stalled = false;
+  const armIdleWatchdog = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      stalled = true;
+      abort.abort();
+    }, NETWORK_IDLE_MS);
+  };
 
-  const total = Number(response.headers.get('content-length')) || 0;
-  if (!response.body?.tee) {
-    progress('download', null, 'Скачиваю мужскую голосовую модель…');
-    const buffer = await response.arrayBuffer();
-    if (buffer.byteLength < 40 * 1024 * 1024) {
-      throw new Error('Сервер передал неполный файл голосовой модели.');
+  try {
+    armIdleWatchdog();
+    const response = await fetch(MODEL_URL, { mode: 'cors', cache: 'no-store', signal: abort.signal });
+    if (!response.ok) throw new Error(`Сервер модели ответил кодом ${response.status}.`);
+
+    const total = Number(response.headers.get('content-length')) || 0;
+    if (!response.body?.tee) {
+      progress('download', 0, 'Скачиваю мужскую голосовую модель…');
+      const buffer = await response.arrayBuffer();
+      if (buffer.byteLength < 40 * 1024 * 1024) {
+        throw new Error('Сервер передал неполный файл голосовой модели.');
+      }
+      return buffer;
     }
-    return buffer;
-  }
 
-  // Tee the network stream: one branch is streamed directly to browser cache,
-  // the other becomes a single ArrayBuffer for ONNX Runtime. This avoids
-  // retaining every chunk and then copying the whole 50 MB file several times.
-  const [cacheBranch, dataBranch] = response.body.tee();
-  const cachePromise = ('caches' in self)
-    ? caches.open(CACHE_NAME)
-        .then(cache => cache.put(MODEL_URL, new Response(cacheBranch, {
-          headers: { 'Content-Type': 'application/octet-stream' }
-        })))
-        .then(() => true)
-        .catch(error => {
-          console.warn('[TTS] Не удалось сохранить голосовую модель в кэш:', error);
-          return false;
-        })
-    : Promise.resolve(false);
+    const [cacheBranch, dataBranch] = response.body.tee();
+    const cachePromise = ('caches' in self)
+      ? caches.open(CACHE_NAME)
+          .then(cache => cache.put(MODEL_URL, new Response(cacheBranch, {
+            headers: { 'Content-Type': 'application/octet-stream' }
+          })))
+          .then(() => true)
+          .catch(error => {
+            console.warn('[TTS] Не удалось сохранить голосовую модель в кэш:', error);
+            return false;
+          })
+      : Promise.resolve(false);
 
-  let received = 0;
-  const monitoredStream = new ReadableStream({
-    start(controller) {
-      const reader = dataBranch.getReader();
-      const pump = async () => {
+    let received = 0;
+    const reader = dataBranch.getReader();
+    const chunks = [];
+    try {
+      while (true) {
+        armIdleWatchdog();
+        let packet;
         try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) {
-              controller.close();
-              return;
-            }
-            received += value.byteLength;
-            progress(
-              'download',
-              total ? Math.min(99, Math.round(received / total * 100)) : null,
-              `Скачано ${(received / 1048576).toFixed(1)} МБ${total ? ` из ${(total / 1048576).toFixed(1)} МБ` : ''}`
-            );
-            controller.enqueue(value);
-          }
+          packet = await reader.read();
         } catch (error) {
-          controller.error(error);
+          if (stalled) throw new Error('Загрузка остановилась: сервер не передавал данные 45 секунд.');
+          throw error;
         }
-      };
-      pump();
+        if (packet.done) break;
+        chunks.push(packet.value);
+        received += packet.value.byteLength;
+        progress(
+          'download',
+          total ? Math.min(99, Math.round(received / total * 100)) : null,
+          `Скачано ${(received / 1048576).toFixed(1)} МБ${total ? ` из ${(total / 1048576).toFixed(1)} МБ` : ''}`
+        );
+      }
+    } catch (error) {
+      abort.abort();
+      try { await reader.cancel(); } catch (_) {}
+      await cachePromise;
+      throw error;
+    } finally {
+      clearTimeout(idleTimer);
     }
-  });
 
-  const buffer = await new Response(monitoredStream).arrayBuffer();
-  await cachePromise;
-  if (buffer.byteLength < 40 * 1024 * 1024) {
-    throw new Error(`Файл пришёл не полностью: ${(buffer.byteLength / 1048576).toFixed(1)} МБ.`);
+    const bytes = new Uint8Array(received);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    await cachePromise;
+
+    if (bytes.byteLength < 40 * 1024 * 1024) {
+      throw new Error(`Файл пришёл не полностью: ${(bytes.byteLength / 1048576).toFixed(1)} МБ.`);
+    }
+    return bytes.buffer;
+  } finally {
+    clearTimeout(idleTimer);
   }
-  return buffer;
 }
 
 async function getModelBytes() {
@@ -114,8 +146,8 @@ async function getModelBytes() {
     try {
       progress('download', 0, attempt === 1
         ? 'Скачиваю мужскую русскую голосовую модель · около 48,5 МБ'
-        : 'Повторяю загрузку после временного сбоя…');
-      return await downloadModelAttempt(attempt);
+        : 'Соединение прервалось. Повторяю загрузку…');
+      return await downloadModelAttempt();
     } catch (error) {
       lastError = error;
       console.error(`[TTS] Попытка загрузки ${attempt} не удалась:`, error);
@@ -124,7 +156,6 @@ async function getModelBytes() {
           const cache = await caches.open(CACHE_NAME);
           await cache.delete(MODEL_URL);
         } catch (_) {}
-        progress('retry', null, 'Соединение прервалось. Повторяю загрузку один раз…');
       }
     }
   }
@@ -145,10 +176,16 @@ async function loadEngine() {
     }
     vocab = loadedVocab;
 
-    progress('engine', null, 'Файл скачан. Запускаю ONNX Runtime Web — это может занять время.');
+    progress('engine', null, 'Файл готов. Запускаю голосовой движок — это может занять время.');
     ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
     ort.env.wasm.numThreads = 1;
     ort.env.wasm.proxy = false;
+
+    // ONNX may spend several minutes compiling/initializing on slower PCs.
+    // Send activity updates so the page's inactivity watchdog does not kill it.
+    const heartbeat = setInterval(() => {
+      progress('engine', null, 'Голосовой движок ещё запускается. Не закрывай страницу…');
+    }, 12000);
 
     try {
       session = await ort.InferenceSession.create(new Uint8Array(modelBytes), {
@@ -159,7 +196,9 @@ async function loadEngine() {
         intraOpNumThreads: 1
       });
     } catch (error) {
-      throw new Error(`Файл скачан, но голосовой движок ONNX/WASM не запустился: ${String(error?.message || error)}. Проверь доступную память и загрузку WASM.`);
+      throw new Error(`Файл скачан, но ONNX/WASM не запустился: ${String(error?.message || error)}. Возможно, браузеру не хватает оперативной памяти.`);
+    } finally {
+      clearInterval(heartbeat);
     }
 
     const required = ['input_ids', 'attention_mask', 'sid'];
