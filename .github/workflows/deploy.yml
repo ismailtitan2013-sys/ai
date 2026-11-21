@@ -73,6 +73,22 @@ jobs:
           )
           PY
           node --check /tmp/history-reader-inline.js
+          python - <<'PY'
+          from pathlib import Path
+          html = Path('_site/index.html').read_text(encoding='utf-8')
+          needles = ('4 минуты', '240000', '240_000', 'voice', 'Voice', 'tts-worker', 'Проверить звук', 'Загрузка голоса')
+          for needle in needles:
+              positions = []
+              start = 0
+              while len(positions) < 5:
+                  pos = html.find(needle, start)
+                  if pos < 0:
+                      break
+                  positions.append(pos)
+                  start = pos + len(needle)
+              for pos in positions[:2]:
+                  print('SOURCE_CONTEXT', repr(needle), html[max(0, pos-450):min(len(html), pos+700)])
+          PY
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
