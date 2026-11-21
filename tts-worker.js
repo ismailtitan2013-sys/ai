@@ -4,7 +4,7 @@ import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/o
 const MODEL_BASE = 'https://huggingface.co/utrobinmv/tts_ru_free_hf_vits_low_multispeaker/resolve/main/';
 const MODEL_URL = MODEL_BASE + 'model.onnx';
 const VOCAB_URL = MODEL_BASE + 'vocab.json';
-const CACHE_NAME = 'history-reader-tts-model-v2';
+const CACHE_NAME = 'history-reader-tts-model-v1';
 const SAMPLE_RATE = 16000;
 const MALE_SPEAKER_ID = 1;
 const BLANK_TOKEN = '_';
