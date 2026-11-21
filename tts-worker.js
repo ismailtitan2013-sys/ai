@@ -4,7 +4,7 @@ import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/o
 const MODEL_BASE = 'https://huggingface.co/utrobinmv/tts_ru_free_hf_vits_low_multispeaker/resolve/main/';
 const MODEL_URL = MODEL_BASE + 'model.onnx';
 const VOCAB_URL = MODEL_BASE + 'vocab.json';
-const CACHE_NAME = 'history-reader-tts-model-v1';
+const CACHE_NAME = 'history-reader-tts-model-v2';
 const SAMPLE_RATE = 16000;
 const MALE_SPEAKER_ID = 1;
 const BLANK_TOKEN = '_';
@@ -20,62 +20,115 @@ function progress(stage, percent, message) {
 }
 
 async function fetchJson(url) {
-  const response = await fetch(url, { mode: 'cors' });
+  const response = await fetch(url, { mode: 'cors', cache: 'force-cache' });
   if (!response.ok) throw new Error(`Не удалось загрузить словарь голоса (${response.status}).`);
   return response.json();
 }
 
-async function getModelBytes() {
-  let cache = null;
-  try {
-    if ('caches' in self) {
-      cache = await caches.open(CACHE_NAME);
-      const cached = await cache.match(MODEL_URL);
-      if (cached) {
-        progress('cache', 100, 'Голос найден в кэше браузера');
-        return await cached.arrayBuffer();
-      }
-    }
-  } catch (error) {
-    console.warn('[TTS] Кэш недоступен:', error);
-  }
-
-  progress('download', 0, 'Скачиваю мужской русский голос · около 51 МБ');
-  const response = await fetch(MODEL_URL, { mode: 'cors' });
-  if (!response.ok) throw new Error(`Модель голоса недоступна (${response.status}). Проверь подключение к интернету.`);
+async function downloadModelAttempt(attempt) {
+  const response = await fetch(MODEL_URL, { mode: 'cors', cache: 'no-store' });
+  if (!response.ok) throw new Error(`Сервер модели ответил кодом ${response.status}.`);
 
   const total = Number(response.headers.get('content-length')) || 0;
-  if (!response.body?.getReader) {
+  if (!response.body?.tee) {
+    progress('download', null, 'Скачиваю мужскую голосовую модель…');
     const buffer = await response.arrayBuffer();
-    try { if (cache) await cache.put(MODEL_URL, new Response(buffer.slice(0))); } catch (_) {}
-    progress('download', 100, 'Модель скачана');
+    if (buffer.byteLength < 40 * 1024 * 1024) {
+      throw new Error('Сервер передал неполный файл голосовой модели.');
+    }
     return buffer;
   }
 
-  const reader = response.body.getReader();
-  const chunks = [];
+  // Tee the network stream: one branch is streamed directly to browser cache,
+  // the other becomes a single ArrayBuffer for ONNX Runtime. This avoids
+  // retaining every chunk and then copying the whole 50 MB file several times.
+  const [cacheBranch, dataBranch] = response.body.tee();
+  const cachePromise = ('caches' in self)
+    ? caches.open(CACHE_NAME)
+        .then(cache => cache.put(MODEL_URL, new Response(cacheBranch, {
+          headers: { 'Content-Type': 'application/octet-stream' }
+        })))
+        .then(() => true)
+        .catch(error => {
+          console.warn('[TTS] Не удалось сохранить голосовую модель в кэш:', error);
+          return false;
+        })
+    : Promise.resolve(false);
+
   let received = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    received += value.byteLength;
-    progress('download', total ? Math.round(received / total * 100) : null,
-      `Скачано ${(received / 1048576).toFixed(1)} МБ${total ? ` из ${(total / 1048576).toFixed(1)} МБ` : ''}`);
+  const monitoredStream = new ReadableStream({
+    start(controller) {
+      const reader = dataBranch.getReader();
+      const pump = async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+              controller.close();
+              return;
+            }
+            received += value.byteLength;
+            progress(
+              'download',
+              total ? Math.min(99, Math.round(received / total * 100)) : null,
+              `Скачано ${(received / 1048576).toFixed(1)} МБ${total ? ` из ${(total / 1048576).toFixed(1)} МБ` : ''}`
+            );
+            controller.enqueue(value);
+          }
+        } catch (error) {
+          controller.error(error);
+        }
+      };
+      pump();
+    }
+  });
+
+  const buffer = await new Response(monitoredStream).arrayBuffer();
+  await cachePromise;
+  if (buffer.byteLength < 40 * 1024 * 1024) {
+    throw new Error(`Файл пришёл не полностью: ${(buffer.byteLength / 1048576).toFixed(1)} МБ.`);
+  }
+  return buffer;
+}
+
+async function getModelBytes() {
+  try {
+    if ('caches' in self) {
+      const cache = await caches.open(CACHE_NAME);
+      const cached = await cache.match(MODEL_URL);
+      if (cached) {
+        const buffer = await cached.arrayBuffer();
+        if (buffer.byteLength >= 40 * 1024 * 1024) {
+          progress('cache', 100, 'Мужской голос найден в кэше браузера');
+          return buffer;
+        }
+        await cache.delete(MODEL_URL);
+      }
+    }
+  } catch (error) {
+    console.warn('[TTS] Не удалось прочитать кэш модели:', error);
   }
 
-  const bytes = new Uint8Array(received);
-  let offset = 0;
-  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-  try {
-    if (cache) await cache.put(MODEL_URL, new Response(bytes.slice(0), {
-      headers: { 'Content-Type': 'application/octet-stream' }
-    }));
-  } catch (error) {
-    console.warn('[TTS] Не удалось сохранить модель в кэш:', error);
+  let lastError = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      progress('download', 0, attempt === 1
+        ? 'Скачиваю мужскую русскую голосовую модель · около 48,5 МБ'
+        : 'Повторяю загрузку после временного сбоя…');
+      return await downloadModelAttempt(attempt);
+    } catch (error) {
+      lastError = error;
+      console.error(`[TTS] Попытка загрузки ${attempt} не удалась:`, error);
+      if (attempt < 2) {
+        try {
+          const cache = await caches.open(CACHE_NAME);
+          await cache.delete(MODEL_URL);
+        } catch (_) {}
+        progress('retry', null, 'Соединение прервалось. Повторяю загрузку один раз…');
+      }
+    }
   }
-  progress('download', 100, 'Модель скачана; подготавливаю голосовой движок');
-  return bytes.buffer;
+  throw new Error(`Не удалось скачать голосовую модель: ${String(lastError?.message || lastError)}`);
 }
 
 async function loadEngine() {
@@ -83,7 +136,7 @@ async function loadEngine() {
   if (loadingPromise) return loadingPromise;
 
   loadingPromise = (async () => {
-    progress('prepare', 0, 'Загружаю словарь и конфигурацию голоса');
+    progress('prepare', 0, 'Подготавливаю русский мужской голос');
     const [loadedVocab, modelBytes] = await Promise.all([fetchJson(VOCAB_URL), getModelBytes()]);
     if (!loadedVocab || typeof loadedVocab !== 'object' ||
         typeof loadedVocab['а'] !== 'number' ||
@@ -92,18 +145,22 @@ async function loadEngine() {
     }
     vocab = loadedVocab;
 
-    progress('engine', 100, 'Подготавливаю ONNX Runtime Web');
+    progress('engine', null, 'Файл скачан. Запускаю ONNX Runtime Web — это может занять время.');
     ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
     ort.env.wasm.numThreads = 1;
     ort.env.wasm.proxy = false;
 
-    session = await ort.InferenceSession.create(new Uint8Array(modelBytes), {
-      executionProviders: ['wasm'],
-      graphOptimizationLevel: 'all',
-      executionMode: 'sequential',
-      enableCpuMemArena: true,
-      intraOpNumThreads: 1
-    });
+    try {
+      session = await ort.InferenceSession.create(new Uint8Array(modelBytes), {
+        executionProviders: ['wasm'],
+        graphOptimizationLevel: 'all',
+        executionMode: 'sequential',
+        enableCpuMemArena: true,
+        intraOpNumThreads: 1
+      });
+    } catch (error) {
+      throw new Error(`Файл скачан, но голосовой движок ONNX/WASM не запустился: ${String(error?.message || error)}. Проверь доступную память и загрузку WASM.`);
+    }
 
     const required = ['input_ids', 'attention_mask', 'sid'];
     const missing = required.filter(name => !session.inputNames.includes(name));
@@ -136,8 +193,6 @@ function tokenize(text) {
   }
   if (!ids.length) throw new Error('Нет текста для озвучивания.');
 
-  // VitsTokenizer has add_blank=true: insert the "_" token (ID 1)
-  // before, between and after characters. Space is a different token (ID 0).
   const blankId = BigInt(vocab[BLANK_TOKEN]);
   const result = new BigInt64Array(ids.length * 2 + 1);
   result.fill(blankId);
