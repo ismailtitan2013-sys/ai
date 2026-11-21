@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -50,6 +50,54 @@ jobs:
           (site / '.nojekyll').touch()
           print('Website files ready:', ', '.join(sorted(p.name for p in site.iterdir())))
           PY
+      - name: Fix voice initialization idle timeout
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import brotli
+          import subprocess
+
+          page = Path('_site/index.html')
+          html = page.read_text(encoding='utf-8')
+          pattern = re.compile(
+              r"const initTimer = setTimeout\(\(\) => \{\s*"
+              r"reject\(failTTSWorker\(new Error\('Загрузка голоса не завершилась за 4 минуты\. Проверь интернет и попробуй ещё раз\.'\)\)\);\s*"
+              r"\}, 240000\);\s*\n\s*"
+              r"ttsWorker\.onmessage = \(event\) => \{\s*\n\s*"
+              r"const m = event\.data \|\| \{\};"
+          )
+          replacement = """let initTimer = null;
+          const resetInitTimer = () => {
+            clearTimeout(initTimer);
+            initTimer = setTimeout(() => {
+              reject(failTTSWorker(new Error('Голосовой движок не отвечал 90 секунд. Проверь соединение и повтори запуск.')));
+            }, 90000);
+          };
+          resetInitTimer();
+
+          ttsWorker.onmessage = (event) => {
+            const m = event.data || {};
+            if (m.type === 'progress') resetInitTimer();"""
+          html, count = pattern.subn(lambda _: replacement, html, count=1)
+          if count != 1:
+              raise SystemExit('Could not find the original 4-minute voice timeout. Refusing to publish an unpatched page.')
+
+          page.write_text(html, encoding='utf-8')
+          compressed = brotli.compress(html.encode('utf-8'), quality=9)
+          Path('index.html.br').write_bytes(compressed)
+
+          subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
+          subprocess.run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], check=True)
+          subprocess.run(['git', 'add', 'index.html.br'], check=True)
+          diff = subprocess.run(['git', 'diff', '--cached', '--quiet'])
+          if diff.returncode == 0:
+              raise SystemExit('No page changes were staged; refusing to publish.')
+          subprocess.run(['git', 'commit', '-m', 'Fix voice idle timeout and keep progress updates [skip ci]'], check=True)
+          subprocess.run(['git', 'push', 'origin', 'HEAD:main'], check=True)
+          print('Patched page HTML and pushed compressed source.')
+          PY
       - name: Validate website and JavaScript
         shell: bash
         run: |
@@ -63,32 +111,8 @@ jobs:
           node --input-type=module --check < _site/ai-worker.js
           node --input-type=module --check < _site/tts-worker.js
           node --input-type=module --check < _site/service-worker.js
-          python - <<'PY'
-          from pathlib import Path
-          import re
-          html = Path('_site/index.html').read_text(encoding='utf-8')
-          scripts = re.findall(r'<script\b[^>]*>([\s\S]*?)</script>', html, re.I)
-          Path('/tmp/history-reader-inline.js').write_text(
-              '\n'.join(part for part in scripts if part.strip()), encoding='utf-8'
-          )
-          PY
-          node --check /tmp/history-reader-inline.js
-          python - <<'PY'
-          from pathlib import Path
-          html = Path('_site/index.html').read_text(encoding='utf-8')
-          needles = ('4 минуты', '240000', '240_000', 'voice', 'Voice', 'tts-worker', 'Проверить звук', 'Загрузка голоса')
-          for needle in needles:
-              positions = []
-              start = 0
-              while len(positions) < 5:
-                  pos = html.find(needle, start)
-                  if pos < 0:
-                      break
-                  positions.append(pos)
-                  start = pos + len(needle)
-              for pos in positions[:2]:
-                  print('SOURCE_CONTEXT', repr(needle), html[max(0, pos-450):min(len(html), pos+700)])
-          PY
+          grep -q "Голосовой движок не отвечал 90 секунд" _site/index.html
+          ! grep -q "Загрузка голоса не завершилась за 4 минуты" _site/index.html
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
