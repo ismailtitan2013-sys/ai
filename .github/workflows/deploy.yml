@@ -30,20 +30,49 @@ jobs:
           from pathlib import Path
           import brotli
 
-          site = Path("_site")
+          site = Path('_site')
           site.mkdir(exist_ok=True)
-          source = Path("index.html.br")
-          if not source.is_file():
-              raise SystemExit("Missing compressed index.html.br")
-          (site / "index.html").write_bytes(brotli.decompress(source.read_bytes()))
-          for name in ("ai-worker.js", "tts-worker.js"):
-              path = Path(name)
-              if not path.is_file():
-                  raise SystemExit(f"Missing required worker: {name}")
-              (site / name).write_bytes(path.read_bytes())
-          (site / ".nojekyll").touch()
-          print("Website restored:", sorted(p.name for p in site.iterdir()))
+          compressed = Path('index.html.br')
+          if not compressed.is_file():
+              raise SystemExit('Missing compressed index.html.br')
+          (site / 'index.html').write_bytes(brotli.decompress(compressed.read_bytes()))
+
+          required = (
+              'ai-worker.js', 'tts-worker.js', 'manifest.webmanifest',
+              'service-worker.js', 'icon-192.png', 'icon-512.png'
+          )
+          for name in required:
+              source = Path(name)
+              if not source.is_file():
+                  raise SystemExit(f'Missing required website asset: {name}')
+              (site / name).write_bytes(source.read_bytes())
+
+          (site / '.nojekyll').touch()
+          print('Website files ready:', ', '.join(sorted(p.name for p in site.iterdir())))
           PY
+      - name: Validate website and JavaScript
+        shell: bash
+        run: |
+          test -s _site/index.html
+          test -s _site/ai-worker.js
+          test -s _site/tts-worker.js
+          test -s _site/manifest.webmanifest
+          test -s _site/service-worker.js
+          test -s _site/icon-192.png
+          test -s _site/icon-512.png
+          node --input-type=module --check < _site/ai-worker.js
+          node --input-type=module --check < _site/tts-worker.js
+          node --input-type=module --check < _site/service-worker.js
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          html = Path('_site/index.html').read_text(encoding='utf-8')
+          scripts = re.findall(r'<script\b[^>]*>([\s\S]*?)</script>', html, re.I)
+          Path('/tmp/history-reader-inline.js').write_text(
+              '\n'.join(part for part in scripts if part.strip()), encoding='utf-8'
+          )
+          PY
+          node --check /tmp/history-reader-inline.js
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
