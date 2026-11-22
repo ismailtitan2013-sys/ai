@@ -394,9 +394,9 @@ Path('/tmp/history-reader-inline.js').write_text('\n'.join(s for s in scripts if
 
 required = [
     'SpeechSynthesisUtterance',
-    'speechSynthesis.pause()',
-    'speechSynthesis.resume()',
-    'speechSynthesis.cancel()',
+    'synthesis.pause()',
+    'synthesis.resume()',
+    'window.speechSynthesis.cancel()',
     'id="voiceSelect"',
     'AI-рассказ'
 ]
