@@ -118,23 +118,23 @@ jobs:
           import re
           html = Path('_site/index.html').read_text(encoding='utf-8')
           patterns = [
-              r"m\.type\s*===\s*['\"]audio['\"]",
-              r"m\.type\s*===\s*['\"]error['\"]",
-              r"ttsPending",
+              r"function\\s+speakQueueItem",
+              r"function\\s+buildNarrationQueue",
+              r"function\\s+stopReading",
+              r"function\\s+startReading",
+              r"function\\s+playPcm",
+              r"function\\s+requestTTSAudio",
+              r"m\\.type\\s*===\\s*['\\\"]audio['\\\"]",
+              r"m\\.type\\s*===\\s*['\\\"]error['\\\"]",
               r"AudioContext",
-              r"createBuffer",
-              r"decodeAudioData",
-              r"playNext",
-              r"function\s+read",
-              r"function\s+startReading",
-              r"function\s+play",
-              r"\.onended",
-              r"ttsWorker\.postMessage",
+              r"onclick=['\\\"]togglePlay",
+              r"onclick=['\\\"]startReading",
           ]
           for pattern in patterns:
               matches = list(re.finditer(pattern, html, re.I))
-              for match in matches[:3]:
-                  print('AUDIO_DIAG', pattern, html[max(0,match.start()-850):min(len(html),match.end()+6500)])
+              for match in matches[:2]:
+                  snippet = html[max(0,match.start()-300):min(len(html),match.end()+3000)]
+                  print('AUDIO_DETAIL', pattern, repr(snippet))
           PY
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
