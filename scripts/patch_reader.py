@@ -137,11 +137,12 @@ function optsRate() {
   return Math.max(0.5, Math.min(2, Number(state.rate) || 1));
 }
 """
-replace_once(
-    r"let ttsWorker = null;[\s\S]*?function optsRate\(\) \{ return state\.rate \|\| 1; \}",
-    browser_engine,
-    "neural TTS engine"
-)
+if 'let browserVoices = [];' not in html:
+    replace_once(
+        r"let ttsWorker = null;[\s\S]*?function optsRate\(\) \{ return state\.rate \|\| 1; \}",
+        browser_engine,
+        "neural TTS engine"
+    )
 
 browser_speak = r"""
 function waitForBrowserVoice(timeoutMs = 3000) {
@@ -259,7 +260,7 @@ function testVoice() {
 }
 """
 replace_once(
-    r"async function speakText\(text, opts = \{\}\) \{[\s\S]*?\n\}\n\nfunction testVoice\(\) \{[\s\S]*?\n\}",
+    r"(?:async\s+)?function speakText\(text, opts = \{\}\) \{[\s\S]*?\n\}\n\nfunction testVoice\(\) \{[\s\S]*?\n\}",
     browser_speak,
     "browser speakText and voice test"
 )
@@ -360,23 +361,26 @@ function changeVoice() {
   refreshBrowserVoices();
 }
 """
-replace_once(
-    r"/\* Системные голоса Windows/Google не используются\.[\s\S]*?function changeVoice\(\) \{[^}]*\}",
-    voices_setup.rstrip(),
-    "browser voice selector"
-)
+if "Системные голоса Windows/Google не используются" in html:
+    replace_once(
+        r"/\* Системные голоса Windows/Google не используются\.[\s\S]*?function changeVoice\(\) \{[^}]*\}",
+        voices_setup.rstrip(),
+        "browser voice selector"
+    )
 
 # Save the selected system voice across reloads.
-html = html.replace(
-    "      voiceName: null,\n",
-    "      voiceName: null,\n      browserVoiceURI: state.browserVoiceURI || 'auto',\n",
-    1
-)
-html = html.replace(
-    "    state._voiceName = null;\n",
-    "    state._voiceName = null;\n    state.browserVoiceURI = data.browserVoiceURI || 'auto';\n",
-    1
-)
+if "browserVoiceURI: state.browserVoiceURI" not in html:
+    html = html.replace(
+        "      voiceName: null,\n",
+        "      voiceName: null,\n      browserVoiceURI: state.browserVoiceURI || 'auto',\n",
+        1
+    )
+if "state.browserVoiceURI = data.browserVoiceURI" not in html:
+    html = html.replace(
+        "    state._voiceName = null;\n",
+        "    state._voiceName = null;\n    state.browserVoiceURI = data.browserVoiceURI || 'auto';\n",
+        1
+    )
 
 # Replace settings UI: no neural model download button, just voice choice and test.
 voice_card = r"""<div class="voice-card">
@@ -390,27 +394,29 @@ voice_card = r"""<div class="voice-card">
           <option value="auto">Автоматически · русский голос</option>
         </select>
       </div>"""
-replace_once(
-    r'<div class="voice-card">[\s\S]*?</div>\s*<div class="setting-row">\s*<div class="setting-label">Скорость:',
-    voice_card + """
-      <div class="setting-row">
-        <div class="setting-label">Скорость:""",
-    "settings voice card and selector"
-)
+if 'Встроенный голос Chrome' not in html:
+    replace_once(
+        r'<div class="voice-card">[\s\S]*?</div>\s*<div class="setting-row">\s*<div class="setting-label">Скорость:',
+        voice_card + """
+          <div class="setting-row">
+            <div class="setting-label">Скорость:""",
+        "settings voice card and selector"
+    )
 
-replace_once(
-    r'<div class="setting-row voice-actions-row">[\s\S]*?<div class="setting-row">\s*<div class="setting-label">Размер текста',
-    r"""<div class="setting-row voice-actions-row">
-        <div class="setting-label">Проверка голоса</div>
-        <div class="voice-action-buttons">
-          <button class="tool-btn primary" id="testTTSBtn" onclick="testVoice()">Проверить голос</button>
-        </div>
-      </div>
-      <div class="voice-status-panel" id="ttsDetailStatus">Используется встроенный голос браузера. Загрузка отдельной модели не требуется.</div>
-      <div class="setting-row">
-        <div class="setting-label">Размер текста""",
-    "settings remove neural download"
-)
+if 'Загрузить голос · ≈51 МБ' in html:
+    replace_once(
+        r'<div class="setting-row voice-actions-row">[\s\S]*?<div class="setting-row">\s*<div class="setting-label">Размер текста',
+        r"""<div class="setting-row voice-actions-row">
+            <div class="setting-label">Проверка голоса</div>
+            <div class="voice-action-buttons">
+              <button class="tool-btn primary" id="testTTSBtn" onclick="testVoice()">Проверить голос</button>
+            </div>
+          </div>
+          <div class="voice-status-panel" id="ttsDetailStatus">Используется встроенный голос браузера. Загрузка отдельной модели не требуется.</div>
+          <div class="setting-row">
+            <div class="setting-label">Размер текста""",
+        "settings remove neural download"
+    )
 
 # Update status wording and error log so it no longer claims neural speech.
 html = html.replace("console.error('Neural TTS error:', error);", "console.error('Browser speech error:', error);")
