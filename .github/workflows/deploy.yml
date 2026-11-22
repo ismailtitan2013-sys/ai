@@ -81,22 +81,22 @@ jobs:
             const m = event.data || {};
             if (m.type === 'progress') resetInitTimer();"""
           html, count = pattern.subn(lambda _: replacement, html, count=1)
-          if count != 1:
-              raise SystemExit('Could not find the original 4-minute voice timeout. Refusing to publish an unpatched page.')
+          already_patched = 'Голосовой движок не отвечал 90 секунд' in html and 'resetInitTimer();' in html
+          if count == 1:
+              page.write_text(html, encoding='utf-8')
+              compressed = brotli.compress(html.encode('utf-8'), quality=9)
+              Path('index.html.br').write_bytes(compressed)
 
-          page.write_text(html, encoding='utf-8')
-          compressed = brotli.compress(html.encode('utf-8'), quality=9)
-          Path('index.html.br').write_bytes(compressed)
-
-          subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
-          subprocess.run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], check=True)
-          subprocess.run(['git', 'add', 'index.html.br'], check=True)
-          diff = subprocess.run(['git', 'diff', '--cached', '--quiet'])
-          if diff.returncode == 0:
-              raise SystemExit('No page changes were staged; refusing to publish.')
-          subprocess.run(['git', 'commit', '-m', 'Fix voice idle timeout and keep progress updates [skip ci]'], check=True)
-          subprocess.run(['git', 'push', 'origin', 'HEAD:main'], check=True)
-          print('Patched page HTML and pushed compressed source.')
+              subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
+              subprocess.run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], check=True)
+              subprocess.run(['git', 'add', 'index.html.br'], check=True)
+              subprocess.run(['git', 'commit', '-m', 'Fix voice idle timeout and keep progress updates [skip ci]'], check=True)
+              subprocess.run(['git', 'push', 'origin', 'HEAD:main'], check=True)
+              print('Patched page HTML and pushed compressed source.')
+          elif already_patched:
+              print('Voice idle-timeout patch is already present; no source update needed.')
+          else:
+              raise SystemExit('Voice timeout has an unknown version. Refusing to publish without inspection.')
           PY
       - name: Validate website and JavaScript
         shell: bash
