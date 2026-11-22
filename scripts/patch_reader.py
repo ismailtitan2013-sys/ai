@@ -137,6 +137,18 @@ elif 'Генерирую фразу ${index + 1} из ${chunks.length}' not in h
 html = html.replace('./tts-worker.js?v=3.1.1', './tts-worker.js?v=3.2.0')
 page.write_text(html, encoding='utf-8')
 
+# Temporary diagnostics: inspect exact page reader and TTS handlers from the source.
+for key in (
+    'function startReading', 'async function startReading', 'function stopReading',
+    'function speakQueueItem', 'function buildNarrationQueue', 'function requestTTSAudio',
+    'function playPcm', 'function togglePlay', 'ttsWorker', 'ttsPending',
+    'function updateReadStatus', 'speechSynthesis', 'function testVoice',
+    'Проверить звук', 'function pauseReading', 'function resumeReading'
+):
+    pos = html.find(key)
+    if pos >= 0:
+        print('READER_SOURCE', key, repr(html[max(0, pos - 400):min(len(html), pos + 5500)]))
+
 # Keep the canonical compressed source in the repository in sync with Pages.
 compressed = brotli.compress(html.encode('utf-8'), quality=9)
 source.write_bytes(compressed)
