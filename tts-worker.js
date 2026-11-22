@@ -242,11 +242,18 @@ function tokenize(text) {
 async function synthesize(text, id) {
   if (!session || !vocab) await loadEngine();
 
-  const input = tokenize(text);
+  const cleanText = String(text || '').trim();
+  if (!cleanText) throw new Error('Нет текста для озвучивания.');
+
+  progress('synthesis', null, 'Генерирую аудиофразу…');
+  self.postMessage({ type: 'synthesis-progress', id, message: 'Генерирую речь нейросетью…' });
+
+  const input = tokenize(cleanText);
   const attention = new BigInt64Array(input.length);
   attention.fill(1n);
   const sid = new BigInt64Array([BigInt(MALE_SPEAKER_ID)]);
 
+  const startedAt = performance.now();
   const outputs = await session.run({
     input_ids: new ort.Tensor('int64', input, [1, input.length]),
     attention_mask: new ort.Tensor('int64', attention, [1, attention.length]),
@@ -255,13 +262,42 @@ async function synthesize(text, id) {
 
   const outputName = session.outputNames[0];
   const waveform = outputs[outputName]?.data;
-  if (!waveform?.length) throw new Error('Голосовая модель вернула пустой звук.');
+  if (!waveform?.length) throw new Error('Голосовая модель вернула пустой аудиосигнал.');
 
   const audio = new Float32Array(waveform.length);
+  let peak = 0;
+  let sumSquares = 0;
   for (let i = 0; i < waveform.length; i++) {
-    audio[i] = Math.max(-1, Math.min(1, Number(waveform[i]) || 0));
+    const sample = Number(waveform[i]);
+    if (!Number.isFinite(sample)) throw new Error('Модель вернула повреждённый аудиосигнал.');
+    const clamped = Math.max(-1, Math.min(1, sample));
+    audio[i] = clamped;
+    const abs = Math.abs(clamped);
+    if (abs > peak) peak = abs;
+    sumSquares += clamped * clamped;
   }
-  self.postMessage({ type: 'audio', id, audio, sampling_rate: SAMPLE_RATE }, [audio.buffer]);
+
+  const rms = Math.sqrt(sumSquares / audio.length);
+  const duration = audio.length / SAMPLE_RATE;
+  const inferenceMs = Math.round(performance.now() - startedAt);
+
+  if (peak < 0.00001 || rms < 0.000001) {
+    throw new Error('Нейросеть вернула почти нулевой звук. Проверь текст страницы и перезапусти проверку голоса.');
+  }
+  if (duration < 0.08) {
+    throw new Error('Получился слишком короткий аудиофрагмент. Попробуй другую фразу.');
+  }
+
+  self.postMessage({
+    type: 'audio',
+    id,
+    audio,
+    sampling_rate: SAMPLE_RATE,
+    duration,
+    peak,
+    rms,
+    inference_ms: inferenceMs
+  }, [audio.buffer]);
 }
 
 self.onmessage = (event) => {
