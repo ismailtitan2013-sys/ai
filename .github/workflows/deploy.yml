@@ -62,10 +62,13 @@ jobs:
           node --input-type=module --check < _site/service-worker.js
           test -s /tmp/history-reader-inline.js
           node --check /tmp/history-reader-inline.js
-          grep -q "Chrome не запустил аудиоустройство" _site/index.html
-          grep -q "synthesis-progress" _site/index.html
-          grep -q "Голосовой движок не отвечал 90 секунд" _site/index.html
-          ! grep -q "Загрузка голоса не завершилась за 4 минуты" _site/index.html
+          grep -q "SpeechSynthesisUtterance" _site/index.html
+          grep -q "speechSynthesis.pause()" _site/index.html
+          grep -q "speechSynthesis.resume()" _site/index.html
+          grep -q "id="voiceSelect"" _site/index.html
+          grep -q "AI-рассказ" _site/index.html
+          ! grep -q "Загрузить голос · ≈51 МБ" _site/index.html
+          ! grep -q "tts-worker.js?v=" _site/index.html
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
