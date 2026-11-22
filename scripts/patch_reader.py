@@ -144,32 +144,63 @@ replace_once(
 )
 
 browser_speak = r"""
-function speakText(text, opts = {}) {
-  return new Promise((resolve, reject) => {
+function waitForBrowserVoice(timeoutMs = 3000) {
+  return new Promise(resolve => {
     const synthesis = window.speechSynthesis;
-    if (!synthesis || typeof window.SpeechSynthesisUtterance !== 'function') {
-      reject(new Error('В Chrome недоступно встроенное чтение вслух.'));
-      return;
-    }
-
-    const token = ttsPlaybackToken;
-    const sourceText = opts.noExpand ? String(text || '') : expandForSpeech(String(text || ''));
-    const prepared = sourceText.replace(/\s+/g, ' ').trim();
-    if (!prepared) {
-      resolve();
-      return;
-    }
-
     refreshBrowserVoices();
-    const selectedVoice = getBrowserVoice();
-    if (!selectedVoice) {
-      reject(new Error('Не найден русский голос Chrome/Windows. Открой настройки голоса и установи русский голосовой пакет Windows.'));
+    const immediate = getBrowserVoice();
+    if (immediate) {
+      resolve(immediate);
       return;
     }
 
-    const chunks = typeof splitSpeechChunks === 'function' ? splitSpeechChunks(prepared) : [prepared];
-    let index = 0;
+    let finished = false;
+    let timer = null;
+    const finish = voice => {
+      if (finished) return;
+      finished = true;
+      if (timer) clearTimeout(timer);
+      synthesis.removeEventListener('voiceschanged', onChanged);
+      resolve(voice || null);
+    };
+    const onChanged = () => {
+      refreshBrowserVoices();
+      const voice = getBrowserVoice();
+      if (voice) finish(voice);
+    };
 
+    synthesis.addEventListener('voiceschanged', onChanged);
+    synthesis.getVoices();
+    timer = window.setTimeout(() => {
+      refreshBrowserVoices();
+      finish(getBrowserVoice());
+    }, timeoutMs);
+  });
+}
+
+async function speakText(text, opts = {}) {
+  const synthesis = window.speechSynthesis;
+  if (!synthesis || typeof window.SpeechSynthesisUtterance !== 'function') {
+    throw new Error('В Chrome недоступно встроенное чтение вслух.');
+  }
+
+  const token = ttsPlaybackToken;
+  const sourceText = opts.noExpand ? String(text || '') : expandForSpeech(String(text || ''));
+  const prepared = sourceText.replace(/\s+/g, ' ').trim();
+  if (!prepared) return;
+
+  refreshBrowserVoices();
+  let selectedVoice = getBrowserVoice();
+  if (!selectedVoice) selectedVoice = await waitForBrowserVoice(3000);
+  if (token !== ttsPlaybackToken) return;
+  if (!selectedVoice) {
+    throw new Error('Chrome не предоставил русский голос. Установи русский голосовой пакет Windows и перезапусти Chrome.');
+  }
+
+  const chunks = typeof splitSpeechChunks === 'function' ? splitSpeechChunks(prepared) : [prepared];
+  let index = 0;
+
+  return new Promise((resolve, reject) => {
     const speakNext = () => {
       if (token !== ttsPlaybackToken) {
         currentUtterance = null;
