@@ -29,204 +29,24 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           import brotli
-
           site = Path('_site')
           site.mkdir(exist_ok=True)
-          compressed = Path('index.html.br')
-          if not compressed.is_file():
-              raise SystemExit('Missing compressed index.html.br')
-          (site / 'index.html').write_bytes(brotli.decompress(compressed.read_bytes()))
-
-          required = (
-              'ai-worker.js', 'tts-worker.js', 'manifest.webmanifest',
-              'service-worker.js', 'icon-192.png', 'icon-512.png'
-          )
-          for name in required:
-              source = Path(name)
-              if not source.is_file():
-                  raise SystemExit(f'Missing required website asset: {name}')
-              (site / name).write_bytes(source.read_bytes())
-
+          source = Path('index.html.br')
+          if not source.exists():
+              raise SystemExit('Missing index.html.br')
+          (site / 'index.html').write_bytes(brotli.decompress(source.read_bytes()))
+          for name in ('ai-worker.js', 'tts-worker.js', 'manifest.webmanifest',
+                       'service-worker.js', 'icon-192.png', 'icon-512.png'):
+              src = Path(name)
+              if not src.is_file():
+                  raise SystemExit(f'Missing website asset: {name}')
+              (site / name).write_bytes(src.read_bytes())
           (site / '.nojekyll').touch()
-          print('Website files ready:', ', '.join(sorted(p.name for p in site.iterdir())))
+          print('Restored all website assets.')
           PY
-      - name: Fix voice initialization idle timeout
+      - name: Patch reader voice playback
         shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          import re
-          import brotli
-          import subprocess
-
-          page = Path('_site/index.html')
-          html = page.read_text(encoding='utf-8')
-          pattern = re.compile(
-              r"const initTimer = setTimeout\(\(\) => \{\s*"
-              r"reject\(failTTSWorker\(new Error\('Загрузка голоса не завершилась за 4 минуты\. Проверь интернет и попробуй ещё раз\.'\)\)\);\s*"
-              r"\}, 240000\);\s*\n\s*"
-              r"ttsWorker\.onmessage = \(event\) => \{\s*\n\s*"
-              r"const m = event\.data \|\| \{\};"
-          )
-          replacement = """let initTimer = null;
-          const resetInitTimer = () => {
-            clearTimeout(initTimer);
-            initTimer = setTimeout(() => {
-              reject(failTTSWorker(new Error('Голосовой движок не отвечал 90 секунд. Проверь соединение и повтори запуск.')));
-            }, 90000);
-          };
-          resetInitTimer();
-
-          ttsWorker.onmessage = (event) => {
-            const m = event.data || {};
-            if (m.type === 'progress') resetInitTimer();"""
-          html, count = pattern.subn(lambda _: replacement, html, count=1)
-          already_patched = 'Голосовой движок не отвечал 90 секунд' in html and 'resetInitTimer();' in html
-          changed = count == 1
-          if count != 1 and not already_patched:
-              raise SystemExit('Voice timeout has an unknown version. Refusing to publish without inspection.')
-
-          # Pass synthesis progress back to the visible reader instead of leaving
-          # the user on "Читаю..." while the neural model computes an audio chunk.
-          audio_old = """          pending.resolve({ audio: new Float32Array(m.audio), sampling_rate: m.sampling_rate });
-        } else if (m.type === 'error') {"""
-          audio_new = """          pending.resolve({
-            audio: new Float32Array(m.audio),
-            sampling_rate: m.sampling_rate,
-            duration: Number(m.duration) || 0,
-            peak: Number(m.peak) || 0,
-            rms: Number(m.rms) || 0
-          });
-        } else if (m.type === 'synthesis-progress' && ttsPending.has(m.id)) {
-          updateReadStatus(m.message || 'Генерирую речь…');
-        } else if (m.type === 'error') {"""
-          if audio_old in html:
-              html = html.replace(audio_old, audio_new, 1)
-              changed = True
-          elif "m.type === 'synthesis-progress' && ttsPending.has(m.id)" not in html:
-              raise SystemExit('Could not locate the TTS audio response handler.')
-
-          play_old = """function playPcm(samples, sampleRate, token) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      if (!samples || !samples.length) throw new Error('Получен пустой аудиофрагмент.');
-      const ctx = getSpeechAudioContext();
-      if (!state.isPaused) await ctx.resume();
-      if (token !== ttsPlaybackToken) return resolve();
-      const buffer = ctx.createBuffer(1, samples.length, sampleRate);
-      buffer.copyToChannel(samples, 0);
-      const source = ctx.createBufferSource();
-      source.buffer = buffer;
-      source.playbackRate.value = Math.max(.65, Math.min(1.6, optsRate()));
-      source.detune.value = Math.max(-280, Math.min(280, (state.pitch - 1) * 380));
-      source.connect(ctx.destination);
-      ttsCurrentSource = source;
-      source.onended = () => {
-        if (ttsCurrentSource === source) ttsCurrentSource = null;
-        resolve();
-      };
-      source.start();
-    } catch (error) { reject(error); }
-  });
-}"""
-          play_new = """function playPcm(samples, sampleRate, token) {
-  return new Promise(async (resolve, reject) => {
-    let source = null;
-    let gainNode = null;
-    try {
-      if (!samples || !samples.length) throw new Error('Голосовая модель не передала аудиоданные.');
-      if (token !== ttsPlaybackToken) return resolve();
-
-      const ctx = getSpeechAudioContext();
-      if (!state.isPaused && ctx.state !== 'running') await ctx.resume();
-      if (token !== ttsPlaybackToken) return resolve();
-      if (!state.isPaused && ctx.state !== 'running') {
-        throw new Error('Chrome не запустил аудиоустройство. Проверь громкость и выход звука Windows.');
-      }
-
-      let peak = 0;
-      for (let i = 0; i < samples.length; i++) {
-        const value = Math.abs(Number(samples[i]) || 0);
-        if (value > peak) peak = value;
-      }
-      if (peak < 0.00001) throw new Error('Модель вернула тишину вместо речи. Нажми «Проверить звук» и посмотри статус.');
-
-      // Very quiet PCM is gently normalized before playback; regular samples
-      // are left untouched to preserve the trained voice's natural dynamics.
-      const scale = peak < 0.12 ? Math.min(8, 0.82 / peak) : 1;
-      const normalized = new Float32Array(samples.length);
-      for (let i = 0; i < samples.length; i++) {
-        normalized[i] = Math.max(-1, Math.min(1, (Number(samples[i]) || 0) * scale));
-      }
-
-      const safeRate = Math.max(8000, Math.min(48000, Number(sampleRate) || 16000));
-      const buffer = ctx.createBuffer(1, normalized.length, safeRate);
-      buffer.copyToChannel(normalized, 0);
-
-      source = ctx.createBufferSource();
-      gainNode = ctx.createGain();
-      source.buffer = buffer;
-      source.playbackRate.value = Math.max(.65, Math.min(1.6, optsRate()));
-      source.detune.value = Math.max(-280, Math.min(280, (state.pitch - 1) * 380));
-      gainNode.gain.value = 1;
-      source.connect(gainNode);
-      gainNode.connect(ctx.destination);
-      ttsCurrentSource = source;
-
-      updateReadStatus('Воспроизвожу речь…');
-      source.onended = () => {
-        if (ttsCurrentSource === source) ttsCurrentSource = null;
-        try { source.disconnect(); gainNode.disconnect(); } catch (_) {}
-        resolve();
-      };
-      source.start(0);
-    } catch (error) {
-      try { if (source) source.disconnect(); if (gainNode) gainNode.disconnect(); } catch (_) {}
-      reject(error);
-    }
-  });
-}"""
-          if play_old in html:
-              html = html.replace(play_old, play_new, 1)
-              changed = True
-          elif "Chrome не запустил аудиоустройство" not in html:
-              raise SystemExit('Could not locate the PCM audio playback function.')
-
-          speak_old = """    updateReadStatus(`Готовлю фразу ${index + 1} из ${chunks.length}…`);
-    const result = await requestTTSAudio(chunks[index]);
-    if (token !== ttsPlaybackToken) return;
-    await playPcm(result.audio, result.sampling_rate, token);"""
-          speak_new = """    updateReadStatus(`Генерирую фразу ${index + 1} из ${chunks.length}…`);
-    const result = await requestTTSAudio(chunks[index]);
-    if (token !== ttsPlaybackToken) return;
-    if (!result.audio || !result.audio.length) throw new Error('Нейросеть не вернула аудиофрагмент.');
-    updateReadStatus(`Воспроизвожу фразу ${index + 1} из ${chunks.length}…`);
-    await playPcm(result.audio, result.sampling_rate, token);"""
-          if speak_old in html:
-              html = html.replace(speak_old, speak_new, 1)
-              changed = True
-          elif "Генерирую фразу ${index + 1} из ${chunks.length}" not in html:
-              raise SystemExit('Could not locate the speech synthesis loop.')
-
-          html = html.replace("./tts-worker.js?v=3.1.1", "./tts-worker.js?v=3.2.0")
-          if changed or './tts-worker.js?v=3.1.1' in Path('_site/index.html').read_text(encoding='utf-8'):
-              page.write_text(html, encoding='utf-8')
-              compressed = brotli.compress(html.encode('utf-8'), quality=9)
-              Path('index.html.br').write_bytes(compressed)
-
-              subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
-              subprocess.run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], check=True)
-              subprocess.run(['git', 'add', 'index.html.br'], check=True)
-              diff = subprocess.run(['git', 'diff', '--cached', '--quiet'])
-              if diff.returncode != 0:
-                  subprocess.run(['git', 'commit', '-m', 'Fix neural voice playback and expose synthesis status [skip ci]'], check=True)
-                  subprocess.run(['git', 'push', 'origin', 'HEAD:main'], check=True)
-                  print('Patched reader playback and pushed compressed source.')
-              else:
-                  print('Reader playback patch is already present.')
-          else:
-              print('Reader playback patch is already present.')
-          PY
+        run: python scripts/patch_reader.py
       - name: Validate website and JavaScript
         shell: bash
         run: |
@@ -240,20 +60,12 @@ jobs:
           node --input-type=module --check < _site/ai-worker.js
           node --input-type=module --check < _site/tts-worker.js
           node --input-type=module --check < _site/service-worker.js
+          test -s /tmp/history-reader-inline.js
+          node --check /tmp/history-reader-inline.js
           grep -q "Chrome не запустил аудиоустройство" _site/index.html
           grep -q "synthesis-progress" _site/index.html
           grep -q "Голосовой движок не отвечал 90 секунд" _site/index.html
           ! grep -q "Загрузка голоса не завершилась за 4 минуты" _site/index.html
-          python - <<'PY'
-          from pathlib import Path
-          import re
-          html = Path('_site/index.html').read_text(encoding='utf-8')
-          scripts = re.findall(r'<script\\b[^>]*>([\\s\\S]*?)</script>', html, re.I)
-          Path('/tmp/history-reader-inline.js').write_text(
-              '\\n'.join(part for part in scripts if part.strip()), encoding='utf-8'
-          )
-          PY
-          node --check /tmp/history-reader-inline.js
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
