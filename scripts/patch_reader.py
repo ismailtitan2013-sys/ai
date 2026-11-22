@@ -3,171 +3,408 @@ import re
 import brotli
 import subprocess
 
-repo_root = Path('.').resolve()
-source = repo_root / 'index.html.br'
-site = repo_root / '_site'
+root = Path('.')
+source = root / 'index.html.br'
+site = root / '_site'
 site.mkdir(exist_ok=True)
 page = site / 'index.html'
-if not source.exists():
+if not source.is_file():
     raise SystemExit('Missing index.html.br')
 html = brotli.decompress(source.read_bytes()).decode('utf-8')
 original = html
 
-# Fix the expired fixed timer, if an older source is encountered.
-old_timeout = re.compile(
-    r"const initTimer = setTimeout\(\(\) => \{\s*"
-    r"reject\(failTTSWorker\(new Error\('Загрузка голоса не завершилась за 4 минуты\. Проверь интернет и попробуй ещё раз\.'\)\)\);\s*"
-    r"\}, 240000\);\s*\n\s*"
-    r"ttsWorker\.onmessage = \(event\) => \{\s*\n\s*"
-    r"const m = event\.data \|\| \{\};"
-)
-timeout_replacement = """let initTimer = null;
-const resetInitTimer = () => {
-  clearTimeout(initTimer);
-  initTimer = setTimeout(() => {
-    reject(failTTSWorker(new Error('Голосовой движок не отвечал 90 секунд. Проверь соединение и повтори запуск.')));
-  }, 90000);
-};
-resetInitTimer();
+def replace_once(pattern, replacement, label, flags=re.S):
+    global html
+    updated, count = re.subn(pattern, lambda _m: replacement, html, count=1, flags=flags)
+    if count == 0:
+        raise SystemExit(f'Could not patch {label}: source pattern not found.')
+    html = updated
 
-ttsWorker.onmessage = (event) => {
-  const m = event.data || {};
-  if (m.type === 'progress' && !ttsReady) resetInitTimer();"""
-html, timeout_count = old_timeout.subn(lambda _m: timeout_replacement, html, count=1)
-if timeout_count == 0 and 'Голосовой движок не отвечал 90 секунд' not in html:
-    raise SystemExit('Voice init timeout source did not match expected versions.')
+# Replace the neural TTS worker, ONNX download, and WebAudio pipeline with
+# the built-in browser SpeechSynthesis API. No model download or API call.
+browser_engine = r"""
+let browserVoices = [];
+let currentUtterance = null;
+let ttsPlaybackToken = 0;
+let ttsCurrentSource = null;
+let ttsReady = false;
+let voicesChangeBound = false;
 
-# Add the inference statistics and explicit progress event returned by the worker.
-handler_old = """          pending.resolve({ audio: new Float32Array(m.audio), sampling_rate: m.sampling_rate });
-        } else if (m.type === 'error') {"""
-handler_new = """          pending.resolve({
-            audio: new Float32Array(m.audio),
-            sampling_rate: m.sampling_rate,
-            duration: Number(m.duration) || 0,
-            peak: Number(m.peak) || 0,
-            rms: Number(m.rms) || 0
-          });
-        } else if (m.type === 'synthesis-progress' && ttsPending.has(m.id)) {
-          updateReadStatus(m.message || 'Генерирую речь…');
-        } else if (m.type === 'error') {"""
-if handler_old in html:
-    html = html.replace(handler_old, handler_new, 1)
-elif "m.type === 'synthesis-progress' && ttsPending.has(m.id)" not in html:
-    raise SystemExit('TTS worker response handler was not found.')
+function browserVoiceId(voice) {
+  return voice.voiceURI || (voice.name + '|' + voice.lang);
+}
 
-# Make PCM output robust: verify signal, normalize very quiet frames, and report WebAudio failures.
-play_new = """function playPcm(samples, sampleRate, token) {
-  return new Promise(async (resolve, reject) => {
-    let source = null;
-    let gainNode = null;
-    try {
-      if (!samples || !samples.length) throw new Error('Голосовая модель не передала аудиоданные.');
-      if (token !== ttsPlaybackToken) return resolve();
+function getBrowserVoice() {
+  const select = document.getElementById('voiceSelect');
+  const requested = select?.value || state.browserVoiceURI || 'auto';
+  if (requested && requested !== 'auto') {
+    const chosen = browserVoices.find(voice => browserVoiceId(voice) === requested);
+    if (chosen) return chosen;
+  }
+  return browserVoices.find(voice => /google/i.test(voice.name)) || browserVoices[0] || null;
+}
 
-      const ctx = getSpeechAudioContext();
-      if (!state.isPaused && ctx.state !== 'running') await ctx.resume();
-      if (token !== ttsPlaybackToken) return resolve();
-      if (!state.isPaused && ctx.state !== 'running') {
-        throw new Error('Chrome не запустил аудиоустройство. Проверь громкость и выход звука Windows.');
-      }
+function updateTTSStatus(message, ready = true, progress = 100) {
+  const dot = document.getElementById('ttsDot');
+  const status = document.getElementById('ttsHeaderStatus');
+  const detail = document.getElementById('ttsDetailStatus');
+  const bar = document.getElementById('ttsProgressBar');
+  if (dot) dot.classList.toggle('ready', !!ready);
+  if (status) status.textContent = ready ? 'Голос браузера готов' : message;
+  if (detail) detail.textContent = message;
+  if (bar && progress !== null) bar.style.width = Math.max(0, Math.min(100, progress)) + '%';
+}
 
-      let peak = 0;
-      for (let i = 0; i < samples.length; i++) {
-        const value = Math.abs(Number(samples[i]) || 0);
-        if (value > peak) peak = value;
-      }
-      if (peak < 0.00001) throw new Error('Модель вернула тишину вместо речи. Нажми «Проверить звук» и посмотри статус.');
+function refreshBrowserVoices() {
+  if (!('speechSynthesis' in window)) {
+    ttsReady = false;
+    updateTTSStatus('В этом браузере нет встроенного чтения вслух. Открой сайт в актуальном Google Chrome.', false, 0);
+    return;
+  }
 
-      const scale = peak < 0.12 ? Math.min(8, 0.82 / peak) : 1;
-      const normalized = new Float32Array(samples.length);
-      for (let i = 0; i < samples.length; i++) {
-        normalized[i] = Math.max(-1, Math.min(1, (Number(samples[i]) || 0) * scale));
-      }
+  const allVoices = window.speechSynthesis.getVoices() || [];
+  browserVoices = allVoices
+    .filter(voice => /^ru([_-]|$)/i.test(voice.lang || ''))
+    .sort((a, b) => {
+      const aGoogle = /google/i.test(a.name) ? 0 : 1;
+      const bGoogle = /google/i.test(b.name) ? 0 : 1;
+      return aGoogle - bGoogle || a.name.localeCompare(b.name, 'ru');
+    });
 
-      const safeRate = Math.max(8000, Math.min(48000, Number(sampleRate) || 16000));
-      const buffer = ctx.createBuffer(1, normalized.length, safeRate);
-      buffer.copyToChannel(normalized, 0);
+  const select = document.getElementById('voiceSelect');
+  if (select) {
+    const saved = state.browserVoiceURI || 'auto';
+    select.replaceChildren();
+    const autoOption = document.createElement('option');
+    autoOption.value = 'auto';
+    autoOption.textContent = browserVoices.some(v => /google/i.test(v.name))
+      ? 'Автоматически · Google Русский'
+      : 'Автоматически · русский голос';
+    select.appendChild(autoOption);
 
-      source = ctx.createBufferSource();
-      gainNode = ctx.createGain();
-      source.buffer = buffer;
-      source.playbackRate.value = Math.max(.65, Math.min(1.6, optsRate()));
-      source.detune.value = Math.max(-280, Math.min(280, (state.pitch - 1) * 380));
-      gainNode.gain.value = 1;
-      source.connect(gainNode);
-      gainNode.connect(ctx.destination);
-      ttsCurrentSource = source;
+    browserVoices.forEach(voice => {
+      const option = document.createElement('option');
+      option.value = browserVoiceId(voice);
+      option.textContent = voice.name + ' · ' + voice.lang;
+      select.appendChild(option);
+    });
 
-      updateReadStatus('Воспроизвожу речь…');
-      source.onended = () => {
-        if (ttsCurrentSource === source) ttsCurrentSource = null;
-        try { source.disconnect(); gainNode.disconnect(); } catch (_) {}
-        resolve();
-      };
-      source.start(0);
-    } catch (error) {
-      try { if (source) source.disconnect(); if (gainNode) gainNode.disconnect(); } catch (_) {}
-      reject(error);
+    select.value = [...select.options].some(option => option.value === saved) ? saved : 'auto';
+    if (select.value !== saved && saved !== 'auto') {
+      state.browserVoiceURI = 'auto';
+      saveState();
     }
+  }
+
+  const selected = getBrowserVoice();
+  ttsReady = !!selected;
+  if (selected) {
+    updateTTSStatus('Готово: ' + selected.name + ' (' + selected.lang + '). Голос предоставляется Chrome/Windows; скачивать модель не нужно.', true, 100);
+  } else {
+    updateTTSStatus('Chrome пока не предоставил русский голос. Проверь, установлен ли русский голосовой пакет в Windows, затем перезапусти Chrome.', false, 0);
+  }
+}
+
+function setupVoices() {
+  if (!('speechSynthesis' in window)) {
+    refreshBrowserVoices();
+    return;
+  }
+  if (!voicesChangeBound) {
+    window.speechSynthesis.addEventListener('voiceschanged', refreshBrowserVoices);
+    voicesChangeBound = true;
+  }
+  refreshBrowserVoices();
+  // Chrome may populate its voice list asynchronously after DOMContentLoaded.
+  window.setTimeout(refreshBrowserVoices, 250);
+  window.setTimeout(refreshBrowserVoices, 1000);
+}
+
+function changeVoice() {
+  const select = document.getElementById('voiceSelect');
+  state.browserVoiceURI = select?.value || 'auto';
+  saveState();
+  refreshBrowserVoices();
+}
+
+function loadLocalTTS() {
+  // Kept as a harmless compatibility hook for old saved UI state.
+  setupVoices();
+  refreshBrowserVoices();
+}
+
+function optsRate() {
+  return Math.max(0.5, Math.min(2, Number(state.rate) || 1));
+}
+"""
+replace_once(
+    r"let ttsWorker = null;[\s\S]*?function optsRate\(\) \{ return state\.rate \|\| 1; \}",
+    browser_engine,
+    "neural TTS engine"
+)
+
+browser_speak = r"""
+function speakText(text, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const synthesis = window.speechSynthesis;
+    if (!synthesis || typeof window.SpeechSynthesisUtterance !== 'function') {
+      reject(new Error('В Chrome недоступно встроенное чтение вслух.'));
+      return;
+    }
+
+    const token = ttsPlaybackToken;
+    const sourceText = opts.noExpand ? String(text || '') : expandForSpeech(String(text || ''));
+    const prepared = sourceText.replace(/\s+/g, ' ').trim();
+    if (!prepared) {
+      resolve();
+      return;
+    }
+
+    refreshBrowserVoices();
+    const selectedVoice = getBrowserVoice();
+    if (!selectedVoice) {
+      reject(new Error('Не найден русский голос Chrome/Windows. Открой настройки голоса и установи русский голосовой пакет Windows.'));
+      return;
+    }
+
+    const chunks = typeof splitSpeechChunks === 'function' ? splitSpeechChunks(prepared) : [prepared];
+    let index = 0;
+
+    const speakNext = () => {
+      if (token !== ttsPlaybackToken) {
+        currentUtterance = null;
+        resolve();
+        return;
+      }
+      if (index >= chunks.length) {
+        currentUtterance = null;
+        resolve();
+        return;
+      }
+
+      const utterance = new SpeechSynthesisUtterance(chunks[index++]);
+      utterance.voice = selectedVoice;
+      utterance.lang = selectedVoice.lang || 'ru-RU';
+      utterance.rate = optsRate();
+      utterance.pitch = Math.max(0.7, Math.min(1.35, Number(state.pitch) || 1));
+      utterance.volume = 1;
+
+      utterance.onstart = () => {
+        if (token === ttsPlaybackToken) {
+          updateReadStatus('Воспроизвожу голосом ' + selectedVoice.name + '…');
+        }
+      };
+      utterance.onend = () => {
+        if (currentUtterance === utterance) currentUtterance = null;
+        speakNext();
+      };
+      utterance.onerror = event => {
+        if (currentUtterance === utterance) currentUtterance = null;
+        if (token !== ttsPlaybackToken || event.error === 'canceled' || event.error === 'interrupted') {
+          resolve();
+          return;
+        }
+        reject(new Error('Ошибка голоса браузера: ' + (event.error || 'не удалось воспроизвести текст') + '.'));
+      };
+
+      currentUtterance = utterance;
+      try {
+        synthesis.speak(utterance);
+      } catch (error) {
+        currentUtterance = null;
+        reject(error);
+      }
+    };
+
+    speakNext();
   });
+}
+
+function testVoice() {
+  const button = document.getElementById('testTTSBtn');
+  const text = 'Привет! Это проверка встроенного русского голоса браузера. Никакая отдельная нейросеть для чтения не загружается.';
+  if (button) button.blur();
+  startReadingText(text);
+}
+"""
+replace_once(
+    r"async function speakText\(text, opts = \{\}\) \{[\s\S]*?\n\}\n\nfunction testVoice\(\) \{[\s\S]*?\n\}",
+    browser_speak,
+    "browser speakText and voice test"
+)
+
+# Replace WebAudio pause/resume with the browser's own speech controls.
+toggle_play = r"""
+function togglePlay() {
+  const synthesis = window.speechSynthesis;
+  if (state.isPlaying) {
+    if (state.isPaused) {
+      synthesis.resume();
+      state.isPaused = false;
+      updatePlaybackButtons();
+      updateReadStatus('Чтение продолжается');
+    } else {
+      synthesis.pause();
+      state.isPaused = true;
+      updatePlaybackButtons();
+      updateReadStatus('Пауза');
+    }
+  } else {
+    startReading();
+  }
+}
+"""
+replace_once(
+    r"function togglePlay\(\) \{[\s\S]*?\n\}\n\nfunction unlockAudioFromClick\(\)",
+    toggle_play + "\nfunction unlockAudioFromClick()",
+    "play/pause controls"
+)
+
+unlock = r"""function unlockAudioFromClick() {
+  if (!('speechSynthesis' in window)) {
+    throw new Error('Встроенное чтение вслух недоступно. Открой сайт в актуальном Google Chrome.');
+  }
+  setupVoices();
+  return window.speechSynthesis;
 }"""
-play_pattern = re.compile(r"function playPcm\(samples, sampleRate, token\) \{[\s\S]*?\n\}\n\nfunction optsRate\(\)")
-play_match = play_pattern.search(html)
-if play_match:
-    html = html[:play_match.start()] + play_new + "\n\nfunction optsRate()" + html[play_match.end():]
-elif 'Chrome не запустил аудиоустройство' not in html:
-    raise SystemExit('PCM playback function was not found.')
+replace_once(
+    r"function unlockAudioFromClick\(\) \{[\s\S]*?\n\}\n\nfunction startReading\(\)",
+    unlock + "\n\nfunction startReading()",
+    "browser voice activation"
+)
 
-# Show whether the model is synthesizing or actually playing each phrase.
-speak_old = """    updateReadStatus(`Готовлю фразу ${index + 1} из ${chunks.length}…`);
-    const result = await requestTTSAudio(chunks[index]);
-    if (token !== ttsPlaybackToken) return;
-    await playPcm(result.audio, result.sampling_rate, token);"""
-speak_new = """    updateReadStatus(`Генерирую фразу ${index + 1} из ${chunks.length}…`);
-    const result = await requestTTSAudio(chunks[index]);
-    if (token !== ttsPlaybackToken) return;
-    if (!result.audio || !result.audio.length) throw new Error('Нейросеть не вернула аудиофрагмент.');
-    updateReadStatus(`Воспроизвожу фразу ${index + 1} из ${chunks.length}…`);
-    await playPcm(result.audio, result.sampling_rate, token);"""
-if speak_old in html:
-    html = html.replace(speak_old, speak_new, 1)
-elif 'Генерирую фразу ${index + 1} из ${chunks.length}' not in html:
-    raise SystemExit('Speech synthesis loop was not found.')
+stop = r"""function stopReading() {
+  state.isPlaying = false;
+  state.isPaused = false;
+  ttsPlaybackToken++;
+  if ('speechSynthesis' in window) {
+    try { window.speechSynthesis.cancel(); } catch (_) {}
+  }
+  currentUtterance = null;
+  ttsCurrentSource = null;
+  updatePlaybackButtons();
+  clearHighlight();
+  updateProgress();
+  updateReadStatus('Остановлено');
+}"""
+replace_once(
+    r"function stopReading\(\) \{[\s\S]*?\n\}\nfunction updateProgress\(\)",
+    stop + "\nfunction updateProgress()",
+    "stop reading"
+)
 
-html = html.replace('./tts-worker.js?v=3.1.1', './tts-worker.js?v=3.2.0')
+# Replace obsolete model-download text with the selected built-in browser voice.
+html, status_count = re.subn(
+    r"  updateReadStatus\('Подключаю мужской голос…'\);\s*\n"
+    r"  updateTTSStatus\('Готовлю мужскую русскую озвучку\. При первом запуске скачается модель около 51 МБ\.', ttsReady, ttsReady \? 100 : 0\);",
+    "  updateReadStatus('Подготавливаю встроенный голос Chrome…');\n"
+    "  refreshBrowserVoices();\n"
+    "  const activeBrowserVoice = getBrowserVoice();\n"
+    "  updateTTSStatus(activeBrowserVoice ? ('Используется голос: ' + activeBrowserVoice.name) : 'Русский голос не найден в Chrome. Проверь настройки Windows.', !!activeBrowserVoice, activeBrowserVoice ? 100 : 0);",
+    html,
+    count=1
+)
+if status_count == 0 and "updateReadStatus('Подготавливаю встроенный голос Chrome…')" not in html:
+    raise SystemExit('Could not update startReading status.')
+
+# Replace the old forced-neural voice list with real voices exposed by Chrome.
+voices_setup = r"""
+function setupVoices() {
+  if (!('speechSynthesis' in window)) {
+    refreshBrowserVoices();
+    return;
+  }
+  if (!voicesChangeBound) {
+    window.speechSynthesis.addEventListener('voiceschanged', refreshBrowserVoices);
+    voicesChangeBound = true;
+  }
+  refreshBrowserVoices();
+  window.setTimeout(refreshBrowserVoices, 250);
+  window.setTimeout(refreshBrowserVoices, 1000);
+}
+function changeVoice() {
+  const select = document.getElementById('voiceSelect');
+  state.browserVoiceURI = select?.value || 'auto';
+  saveState();
+  refreshBrowserVoices();
+}
+"""
+replace_once(
+    r"/\* Системные голоса Windows/Google не используются\.[\s\S]*?function changeVoice\(\) \{[^}]*\}",
+    voices_setup.rstrip(),
+    "browser voice selector"
+)
+
+# Save the selected system voice across reloads.
+html = html.replace(
+    "      voiceName: null,\n",
+    "      voiceName: null,\n      browserVoiceURI: state.browserVoiceURI || 'auto',\n",
+    1
+)
+html = html.replace(
+    "    state._voiceName = null;\n",
+    "    state._voiceName = null;\n    state.browserVoiceURI = data.browserVoiceURI || 'auto';\n",
+    1
+)
+
+# Replace settings UI: no neural model download button, just voice choice and test.
+voice_card = r"""<div class="voice-card">
+        <div class="voice-card-heading">Голос рассказчика</div>
+        <div class="voice-card-name">Встроенный голос Chrome</div>
+        <div class="voice-card-note">Используется русский голос, который уже доступен в Chrome или Windows. Отдельную модель скачивать не нужно. Google-голос будет выбран автоматически, если он установлен.</div>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">Голос для чтения</div>
+        <select id="voiceSelect" onchange="changeVoice()" aria-label="Голос для чтения" style="max-width:58%;min-width:180px">
+          <option value="auto">Автоматически · русский голос</option>
+        </select>
+      </div>"""
+replace_once(
+    r'<div class="voice-card">[\s\S]*?</div>\s*<div class="setting-row">\s*<div class="setting-label">Скорость:',
+    voice_card + """
+      <div class="setting-row">
+        <div class="setting-label">Скорость:""",
+    "settings voice card and selector"
+)
+
+replace_once(
+    r'<div class="setting-row voice-actions-row">[\s\S]*?<div class="setting-row">\s*<div class="setting-label">Размер текста',
+    r"""<div class="setting-row voice-actions-row">
+        <div class="setting-label">Проверка голоса</div>
+        <div class="voice-action-buttons">
+          <button class="tool-btn primary" id="testTTSBtn" onclick="testVoice()">Проверить голос</button>
+        </div>
+      </div>
+      <div class="voice-status-panel" id="ttsDetailStatus">Используется встроенный голос браузера. Загрузка отдельной модели не требуется.</div>
+      <div class="setting-row">
+        <div class="setting-label">Размер текста""",
+    "settings remove neural download"
+)
+
+# Update status wording and error log so it no longer claims neural speech.
+html = html.replace("console.error('Neural TTS error:', error);", "console.error('Browser speech error:', error);")
+html = html.replace("Русская нейросетевая модель · Историк", "Встроенный русский голос Chrome")
+html = html.replace("Подключаю локальную голосовую модель…", "Использую встроенный голос браузера…")
+
+# Persist the canonical compressed HTML and syntax-check the inline app script.
 page.write_text(html, encoding='utf-8')
-
-# Temporary diagnostics: inspect exact page reader and TTS handlers from the source.
-for key in (
-    'function startReading', 'async function startReading', 'function stopReading',
-    'function speakQueueItem', 'function buildNarrationQueue', 'function requestTTSAudio',
-    'function playPcm', 'function togglePlay', 'ttsWorker', 'ttsPending',
-    'function updateReadStatus', 'speechSynthesis', 'function testVoice',
-    'Проверить звук', 'function pauseReading', 'function resumeReading'
-):
-    pos = html.find(key)
-    if pos >= 0:
-        print('READER_SOURCE', key, repr(html[max(0, pos - 400):min(len(html), pos + 5500)]))
-
-# Inspect the worker boot path and settings references before replacing them.
-for key in (
-    'function initTTSWorker', 'function updateTTSStatus', 'function failTTSWorker',
-    'function loadLocalTTS', 'function setupTTS', 'function initTTS',
-    'ttsWorker.onmessage =', 'new Worker(', 'const ttsWorker', 'let ttsReady',
-    'DOMContentLoaded', 'initTTSWorker()', 'loadLocalTTS()', 'ttsReady =',
-    'id="voiceSelect"', 'voiceSelect', '<div class="voice-card">'
-):
-    pos = html.find(key)
-    if pos >= 0:
-        print('TTS_BOOT', key, repr(html[max(0, pos - 350):min(len(html), pos + 4000)]))
-
-# Keep the canonical compressed source in the repository in sync with Pages.
-compressed = brotli.compress(html.encode('utf-8'), quality=9)
-source.write_bytes(compressed)
-
-# Write an extracted inline script to let the workflow run a real syntax check.
+source.write_bytes(brotli.compress(html.encode('utf-8'), quality=9))
 scripts = re.findall(r'<script\b[^>]*>([\s\S]*?)</script>', html, re.I)
 Path('/tmp/history-reader-inline.js').write_text('\n'.join(s for s in scripts if s.strip()), encoding='utf-8')
+
+required = [
+    'SpeechSynthesisUtterance',
+    'speechSynthesis.pause()',
+    'speechSynthesis.resume()',
+    'speechSynthesis.cancel()',
+    'id="voiceSelect"',
+    'AI-рассказ'
+]
+for token in required:
+    if token not in html:
+        raise SystemExit('Missing expected browser voice feature: ' + token)
+if 'Загрузить голос · ≈51 МБ' in html or 'tts-worker.js?v=' in html:
+    raise SystemExit('Obsolete neural voice download UI or worker reference remains.')
 
 if html != original:
     subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
@@ -175,10 +412,10 @@ if html != original:
     subprocess.run(['git', 'add', 'index.html.br'], check=True)
     staged = subprocess.run(['git', 'diff', '--cached', '--quiet'])
     if staged.returncode != 0:
-        subprocess.run(['git', 'commit', '-m', 'Fix neural voice playback and expose synthesis status [skip ci]'], check=True)
+        subprocess.run(['git', 'commit', '-m', 'Replace neural voice with built-in Chrome speech [skip ci]'], check=True)
         subprocess.run(['git', 'push', 'origin', 'HEAD:main'], check=True)
-        print('Updated compressed page source.')
+        print('Published source now uses browser SpeechSynthesis; no TTS model is downloaded.')
     else:
-        print('Compressed page source was already up to date.')
+        print('Browser SpeechSynthesis source already up to date.')
 else:
     print('No page changes required.')
