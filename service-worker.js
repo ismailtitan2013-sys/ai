@@ -1,12 +1,11 @@
-const CACHE_NAME = 'history-reader-studio-v3';
+const CACHE_NAME = 'history-reader-studio-v4';
 const SHELL = [
   './',
   './index.html',
   './manifest.webmanifest',
   './icon-192.png',
   './icon-512.png',
-  './ai-worker.js',
-  './tts-worker.js'
+  './ai-worker.js'
 ];
 
 self.addEventListener('install', event => {
@@ -21,9 +20,7 @@ self.addEventListener('activate', event => {
   event.waitUntil((async () => {
     const keys = await caches.keys();
     await Promise.all(keys.filter(key =>
-      key.startsWith('history-reader-') &&
-      key !== CACHE_NAME &&
-      key !== 'history-reader-tts-model-v1'
+      key.startsWith('history-reader-') && key !== CACHE_NAME
     ).map(key => caches.delete(key)));
     await self.clients.claim();
   })());
@@ -47,9 +44,7 @@ self.addEventListener('fetch', event => {
       }
     }
 
-    // Worker URLs can keep the same query string in an already-open browser.
-    // Revalidate them so the latest audio/LLM fixes are not hidden by an old cache.
-    const isWorker = /\/(ai-worker|tts-worker)\.js$/.test(url.pathname);
+    const isWorker = /\/ai-worker\.js$/.test(url.pathname);
     const cached = await cache.match(request);
     if (cached && !isWorker) return cached;
     try {
