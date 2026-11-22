@@ -154,7 +154,8 @@ for key in (
     'function initTTSWorker', 'function updateTTSStatus', 'function failTTSWorker',
     'function loadLocalTTS', 'function setupTTS', 'function initTTS',
     'ttsWorker.onmessage =', 'new Worker(', 'const ttsWorker', 'let ttsReady',
-    'DOMContentLoaded', 'initTTSWorker()', 'loadLocalTTS()', 'ttsReady ='
+    'DOMContentLoaded', 'initTTSWorker()', 'loadLocalTTS()', 'ttsReady =',
+    'id="voiceSelect"', 'voiceSelect', '<div class="voice-card">'
 ):
     pos = html.find(key)
     if pos >= 0:
