@@ -149,6 +149,17 @@ for key in (
     if pos >= 0:
         print('READER_SOURCE', key, repr(html[max(0, pos - 400):min(len(html), pos + 5500)]))
 
+# Inspect the worker boot path and settings references before replacing them.
+for key in (
+    'function initTTSWorker', 'function updateTTSStatus', 'function failTTSWorker',
+    'function loadLocalTTS', 'function setupTTS', 'function initTTS',
+    'ttsWorker.onmessage =', 'new Worker(', 'const ttsWorker', 'let ttsReady',
+    'DOMContentLoaded', 'initTTSWorker()', 'loadLocalTTS()', 'ttsReady ='
+):
+    pos = html.find(key)
+    if pos >= 0:
+        print('TTS_BOOT', key, repr(html[max(0, pos - 350):min(len(html), pos + 4000)]))
+
 # Keep the canonical compressed source in the repository in sync with Pages.
 compressed = brotli.compress(html.encode('utf-8'), quality=9)
 source.write_bytes(compressed)
