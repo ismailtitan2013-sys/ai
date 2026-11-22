@@ -134,7 +134,7 @@ jobs:
           for pattern in patterns:
               matches = list(re.finditer(pattern, html, re.I))
               for match in matches[:3]:
-                  print('AUDIO_DIAG', pattern, html[max(0,match.start()-850):min(len(html),match.end()+1250)])
+                  print('AUDIO_DIAG', pattern, html[max(0,match.start()-850):min(len(html),match.end()+6500)])
           PY
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
