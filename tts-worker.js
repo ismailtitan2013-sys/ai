@@ -245,7 +245,6 @@ async function synthesize(text, id) {
   const cleanText = String(text || '').trim();
   if (!cleanText) throw new Error('Нет текста для озвучивания.');
 
-  progress('synthesis', null, 'Генерирую аудиофразу…');
   self.postMessage({ type: 'synthesis-progress', id, message: 'Генерирую речь нейросетью…' });
 
   const input = tokenize(cleanText);
