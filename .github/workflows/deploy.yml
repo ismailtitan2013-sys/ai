@@ -65,7 +65,7 @@ jobs:
           grep -q "SpeechSynthesisUtterance" _site/index.html
           grep -q "speechSynthesis.pause()" _site/index.html
           grep -q "speechSynthesis.resume()" _site/index.html
-          grep -q "id="voiceSelect"" _site/index.html
+          grep -q 'id="voiceSelect"' _site/index.html
           grep -q "AI-рассказ" _site/index.html
           ! grep -q "Загрузить голос · ≈51 МБ" _site/index.html
           ! grep -q "tts-worker.js?v=" _site/index.html
